@@ -58,6 +58,41 @@ jobs:
           role-to-assume: ${{ secrets.OIDC }}
           aws-region: ${{ env.AWS_REGION }}
 
+      - name: Ensure EC2 Key Pair Exists
+        if: ${{ github.event.inputs.action == 'apply' }}
+        env:
+          KEY_CONTENT: ${{ secrets.KEY }}
+        run: |
+          KEY_NAME="k8s"
+          echo "Checking if key pair '$KEY_NAME' exists in AWS..."
+
+          # Write private key to temp file
+          echo "$KEY_CONTENT" > /tmp/deploy_key.pem
+          chmod 600 /tmp/deploy_key.pem
+
+          # Extract the public key from the private key
+          PUBLIC_KEY=$(ssh-keygen -y -f /tmp/deploy_key.pem)
+
+          # Check if the key pair already exists
+          EXISTS=$(aws ec2 describe-key-pairs \
+            --key-names "$KEY_NAME" \
+            --region $AWS_REGION \
+            --query 'KeyPairs[0].KeyName' \
+            --output text 2>/dev/null || echo "")
+
+          if [ "$EXISTS" = "$KEY_NAME" ]; then
+            echo "✅ Key pair '$KEY_NAME' already exists. Skipping import."
+          else
+            echo "⚠️ Key pair '$KEY_NAME' not found. Importing from KEY secret..."
+            aws ec2 import-key-pair \
+              --key-name "$KEY_NAME" \
+              --public-key-material "$(echo "$PUBLIC_KEY" | base64 -w 0)" \
+              --region $AWS_REGION
+            echo "✅ Key pair '$KEY_NAME' successfully imported."
+          fi
+
+          rm -f /tmp/deploy_key.pem
+
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
 
