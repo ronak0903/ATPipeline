@@ -30,4 +30,8 @@ module "ec2" {
   vpc_id    = var.create_vpc ? module.vpc[0].vpc_id : data.aws_vpc.default.id
 
   ecr_url   = var.create_ecr ? module.ecr[0].repository_url : ""
+
+  create_sg            = var.create_sg
+  create_iam_profile   = var.create_iam_profile
+  existing_iam_profile = var.existing_iam_profile
 }

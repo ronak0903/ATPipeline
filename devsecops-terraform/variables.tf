@@ -39,3 +39,21 @@ variable "create_ecr" {
   description = "Set to true to create a new ECR repo. Set to false if ECR creation is denied."
   default     = false
 }
+
+variable "create_sg" {
+  type        = bool
+  description = "Set to true to create a new Security Group. Set to false to use the Default Security Group."
+  default     = false
+}
+
+variable "create_iam_profile" {
+  type        = bool
+  description = "Set to true to create a new IAM Role and Instance Profile. Set to false to skip or use a pre-existing one."
+  default     = false
+}
+
+variable "existing_iam_profile" {
+  type        = string
+  description = "Name of a pre-existing IAM Instance Profile (e.g. LabInstanceProfile). Ignored if create_iam_profile is true."
+  default     = ""
+}

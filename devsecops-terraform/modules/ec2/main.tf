@@ -1,4 +1,11 @@
+data "aws_security_group" "default" {
+  count  = var.create_sg ? 0 : 1
+  vpc_id = var.vpc_id
+  name   = "default"
+}
+
 resource "aws_security_group" "sg" {
+  count  = var.create_sg ? 1 : 0
   vpc_id = var.vpc_id
 
   ingress {
@@ -31,7 +38,8 @@ resource "aws_security_group" "sg" {
 }
 
 resource "aws_iam_role" "ec2_role" {
-  name = "ec2-ecr-role-devsecops"
+  count = var.create_iam_profile ? 1 : 0
+  name  = "ec2-ecr-role-devsecops"
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
@@ -48,13 +56,15 @@ resource "aws_iam_role" "ec2_role" {
 }
 
 resource "aws_iam_role_policy_attachment" "ecr_readonly" {
-  role       = aws_iam_role.ec2_role.name
+  count      = var.create_iam_profile ? 1 : 0
+  role       = aws_iam_role.ec2_role[0].name
   policy_arn = "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
 }
 
 resource "aws_iam_instance_profile" "ec2_profile" {
-  name = "ec2-ecr-profile-devsecops"
-  role = aws_iam_role.ec2_role.name
+  count = var.create_iam_profile ? 1 : 0
+  name  = "ec2-ecr-profile-devsecops"
+  role  = aws_iam_role.ec2_role[0].name
 }
 
 resource "aws_instance" "devsecops" {
@@ -63,9 +73,9 @@ resource "aws_instance" "devsecops" {
   subnet_id     = var.subnet_id
   key_name      = var.key_name
 
-  vpc_security_group_ids = [aws_security_group.sg.id]
+  vpc_security_group_ids = [var.create_sg ? aws_security_group.sg[0].id : data.aws_security_group.default[0].id]
 
-  iam_instance_profile = aws_iam_instance_profile.ec2_profile.name
+  iam_instance_profile = var.create_iam_profile ? aws_iam_instance_profile.ec2_profile[0].name : (var.existing_iam_profile != "" ? var.existing_iam_profile : null)
 
   root_block_device {
     volume_size = 30
