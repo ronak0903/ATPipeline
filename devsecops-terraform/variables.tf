@@ -15,7 +15,7 @@ variable "key_name" {
 }
 
 variable "instance_type" {
-  default = "t3.micro"
+  default = "t3.medium"
 }
 
 variable "ecr_repo_name" {
