@@ -4,7 +4,3 @@ variable "subnet_id" {}
 variable "vpc_id" {}
 variable "ecr_url" {}
 variable "ami_id" {}
-variable "create_sg" {}
-variable "create_iam_profile" {}
-variable "existing_iam_profile" {}
-variable "region" {}

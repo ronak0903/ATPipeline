@@ -2,6 +2,13 @@ data "aws_vpc" "default" {
   default = true
 }
 
+data "aws_subnets" "default" {
+  filter {
+    name   = "vpc-id"
+    values = [data.aws_vpc.default.id]
+  }
+}
+
 module "vpc" {
   count  = var.create_vpc ? 1 : 0
   source = "./modules/vpc"
@@ -23,16 +30,9 @@ module "ec2" {
   instance_type = var.instance_type
   key_name      = var.key_name
   ami_id        = var.ami_id
-  region        = var.region
 
-  # If create_vpc is false, pass null to let AWS automatically select the default subnet.
-  # This avoids calling DescribeSubnets, which is blocked by SCP in restricted accounts.
-  subnet_id = var.create_vpc ? module.vpc[0].public_subnet_id : null
+  subnet_id = var.create_vpc ? module.vpc[0].public_subnet_id : element(data.aws_subnets.default.ids, 0)
   vpc_id    = var.create_vpc ? module.vpc[0].vpc_id : data.aws_vpc.default.id
 
   ecr_url   = var.create_ecr ? module.ecr[0].repository_url : ""
-
-  create_sg            = var.create_sg
-  create_iam_profile   = var.create_iam_profile
-  existing_iam_profile = var.existing_iam_profile
 }
