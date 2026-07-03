@@ -40,7 +40,7 @@ jobs:
       actions: write
 
     env:
-      AWS_REGION: ap-south-1
+      AWS_REGION: us-east-1
 
     outputs:
       ec2_ip: ${{ steps.tf.outputs.ec2_ip }}
@@ -140,7 +140,7 @@ jobs:
       contents: read
 
     env:
-      AWS_REGION: ap-south-1
+      AWS_REGION: us-east-1
       BRANCH: ${{ github.event.inputs.branch || vars.BRANCH }}
       GBLINK: ${{ github.event.inputs.repo_url || vars.GBLINK }}
 
@@ -346,7 +346,7 @@ jobs:
       contents: read
 
     env:
-      AWS_REGION: ap-south-1
+      AWS_REGION: us-east-1
       EC2_IP: ${{ needs.terraform.outputs.ec2_ip }}
       NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
 
@@ -430,7 +430,7 @@ jobs:
       contents: read
 
     env:
-      AWS_REGION: ap-south-1
+      AWS_REGION: us-east-1
       EC2_IP: ${{ needs.terraform.outputs.ec2_ip }}
       BRANCH: ${{ github.event.inputs.branch || vars.BRANCH }}
       GBLINK: ${{ github.event.inputs.repo_url || vars.GBLINK }}
