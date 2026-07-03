@@ -22,3 +22,8 @@ variable "ecr_repo_name" {
   default = "devsecops-repo"
 }
 
+variable "ami_id" {
+  type        = string
+  description = "Hardcoded AMI ID to avoid DescribeImages permission issues"
+  default     = "ami-0a7cf821b91bcccbc" # Ubuntu 22.04 LTS in ap-south-1 (Mumbai)
+}
