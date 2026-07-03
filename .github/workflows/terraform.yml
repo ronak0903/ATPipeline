@@ -1,0 +1,669 @@
+name: "Terraform Infra Pipeline"
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "Choose action"
+        required: true
+        type: choice
+        options:
+          - apply
+          - destroy
+      repo_url:
+        description: "GitHub repository URL to clone and deploy"
+        required: true
+        type: string
+        default: "https://github.com/your-username/your-repo.git"
+      branch:
+        description: "Branch name of the repository"
+        required: false
+        type: string
+        default: "main"
+      app_port:
+        description: "Port where the application will run"
+        required: true
+        type: string
+        default: "80"
+
+jobs:
+  terraform:
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: devsecops-terraform
+
+    permissions:
+      id-token: write
+      contents: write
+      actions: write
+
+    env:
+      AWS_REGION: ap-south-1
+
+    outputs:
+      ec2_ip: ${{ steps.tf.outputs.ec2_ip }}
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Show files
+        run: ls -R
+
+      - name: Configure AWS Credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.OIDC }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform Init
+        run: terraform init
+
+      - name: Terraform Validate
+        run: terraform validate
+
+      - name: Terraform Plan
+        if: ${{ github.event.inputs.action == 'apply' }}
+        run: terraform plan -out=tfplan
+
+      - name: Terraform Apply
+        if: ${{ github.event.inputs.action == 'apply' }}
+        run: terraform apply -auto-approve tfplan
+
+      - name: Get EC2 IP
+        if: ${{ github.event.inputs.action == 'apply' }}
+        id: tf
+        run: |
+          echo "ec2_ip=$(terraform output -raw ec2_public_ip)" >> $GITHUB_OUTPUT
+      
+      - name: Save EC2 IP Variable
+        if: ${{ github.event.inputs.action == 'apply' }}
+        continue-on-error: true
+        run: |
+          EC2_IP="${{ steps.tf.outputs.ec2_ip }}"
+          echo "Updating/Creating EC2_IP GitHub variable to $EC2_IP..."
+          
+          # Check if the repository variable exists
+          STATUS_CODE=$(curl -o /dev/null -s -w "%{http_code}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${{ secrets.GB_TOKEN }}" \
+            https://api.github.com/repos/${{ github.repository }}/actions/variables/EC2_IP)
+
+          if [ "$STATUS_CODE" -eq 200 ]; then
+            # Update existing variable
+            curl -L \
+              -X PATCH \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${{ secrets.GB_TOKEN }}" \
+              https://api.github.com/repos/${{ github.repository }}/actions/variables/EC2_IP \
+              -d "{\"name\":\"EC2_IP\",\"value\":\"$EC2_IP\"}"
+          else
+            # Create new variable
+            curl -L \
+              -X POST \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${{ secrets.GB_TOKEN }}" \
+              https://api.github.com/repos/${{ github.repository }}/actions/variables \
+              -d "{\"name\":\"EC2_IP\",\"value\":\"$EC2_IP\"}"
+          fi
+
+      - name: Print EC2 IP
+        if: ${{ github.event.inputs.action == 'apply' }}
+        run: |
+          echo "EC2 IP: ${{ steps.tf.outputs.ec2_ip }}"
+
+      - name: Commit tfstate
+        if: ${{ github.event.inputs.action == 'apply' }}
+        run: |
+          git config --global user.name "github-actions"
+          git config --global user.email "github-actions@github.com"
+          git add terraform.tfstate || true
+          git commit -m "update terraform state" || echo "No changes"
+          git push
+
+      - name: Terraform Destroy
+        if: ${{ github.event.inputs.action == 'destroy' }}
+        run: terraform destroy -auto-approve
+
+  deploy-image:
+    runs-on: ubuntu-latest
+    needs: terraform
+    if: ${{ github.event.inputs.action == 'apply' }}
+
+    permissions:
+      id-token: write
+      contents: read
+
+    env:
+      AWS_REGION: ap-south-1
+      BRANCH: ${{ github.event.inputs.branch || vars.BRANCH }}
+      GBLINK: ${{ github.event.inputs.repo_url || vars.GBLINK }}
+
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.OIDC }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Clone App
+        run: |
+          if [ -z "$BRANCH" ]; then
+            git clone "$GBLINK" app
+          else
+            git clone -b "$BRANCH" "$GBLINK" app
+          fi
+
+      - name: Generate Project Key
+        id: sonar_key
+        run: |
+          # Robustly handle both HTTPS and SSH Git formats
+          CLEAN_URL=$(echo "$GBLINK" | sed -E 's/.*github\.com[\/:]//' | sed 's/\.git$//')
+          OWNER=$(echo "$CLEAN_URL" | cut -d'/' -f1)
+          REPO=$(echo "$CLEAN_URL" | cut -d'/' -f2)
+          KEY="${OWNER}_${REPO}"
+          echo "key=$KEY" >> $GITHUB_OUTPUT
+
+      - name: Detect Project Type & Build
+        id: build
+        run: |
+          cd app
+          echo "Detecting project type..."
+
+          # Java - Maven
+          if [ -f "pom.xml" ]; then
+            echo "project_type=maven" >> $GITHUB_OUTPUT
+            echo "Maven project detected"
+            mvn clean install -DskipTests
+
+          # Java - Gradle
+          elif [ -f "build.gradle" ]; then
+            echo "project_type=gradle" >> $GITHUB_OUTPUT
+            echo "Gradle project detected"
+            chmod +x gradlew || true
+            ./gradlew build
+
+          # Node.js
+          elif [ -f "package.json" ]; then
+            echo "project_type=nodejs" >> $GITHUB_OUTPUT
+            echo "Node.js project detected"
+            npm install || true
+
+          else
+            echo "project_type=none" >> $GITHUB_OUTPUT
+            echo "No build needed"
+          fi
+
+      - name: Verify & Set Java Binaries Path
+        run: |
+          cd app
+          
+          # Check for Maven binaries
+          if [ -d "target/classes" ]; then
+            echo "SONAR_JAVA_BINARIES=target/classes" >> $GITHUB_ENV
+            echo "✅ Maven binaries found"
+          # Check for Gradle binaries
+          elif [ -d "build/classes/java/main" ]; then
+            echo "SONAR_JAVA_BINARIES=build/classes/java/main" >> $GITHUB_ENV
+            echo "✅ Gradle binaries found"
+          else
+            # Exclude .java files if no binaries found
+            echo "SONAR_JAVA_BINARIES=" >> $GITHUB_ENV
+            echo "SONAR_EXCLUSIONS=**/*.java" >> $GITHUB_ENV
+            echo "⚠️ No compiled classes found, excluding Java files"
+          fi
+
+      - name: SonarCloud Scan
+        uses: SonarSource/sonarcloud-github-action@v2
+        with:
+          projectBaseDir: app
+          args: >
+            -Dsonar.projectKey=${{ steps.sonar_key.outputs.key }}
+            -Dsonar.organization=${{ secrets.SONAR_ORG }}
+            -Dsonar.sources=.
+            ${{ env.SONAR_JAVA_BINARIES != '' && format('-Dsonar.java.binaries={0}', env.SONAR_JAVA_BINARIES) || '' }}
+            ${{ env.SONAR_EXCLUSIONS != '' && format('-Dsonar.exclusions={0}', env.SONAR_EXCLUSIONS) || '' }}
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+      - name: Fetch SonarCloud Report
+        run: |
+          mkdir -p sonar-report
+
+          PROJECT_KEY=${{ steps.sonar_key.outputs.key }}
+
+          echo "Waiting for Sonar analysis..."
+          sleep 20
+
+          echo "Fetching SonarCloud data for $PROJECT_KEY"
+
+          # Issues
+          curl -s -u ${{ secrets.SONAR_TOKEN }}: \
+          "https://sonarcloud.io/api/issues/search?componentKeys=$PROJECT_KEY" \
+          -o sonar-report/issues.json
+
+          # Metrics
+          curl -s -u ${{ secrets.SONAR_TOKEN }}: \
+          "https://sonarcloud.io/api/measures/component?component=$PROJECT_KEY&metricKeys=bugs,vulnerabilities,code_smells,coverage,duplicated_lines_density" \
+          -o sonar-report/metrics.json
+
+          echo "Sonar JSON report downloaded"
+          ls -lah sonar-report
+
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Convert Sonar JSON to HTML
+        run: |
+          echo "Generating HTML report..."
+
+          echo "<html><head><title>Sonar Report</title>
+          <style>
+          body { font-family: Arial; margin: 20px; }
+          h1 { color: #2c3e50; }
+          table { border-collapse: collapse; width: 100%; }
+          th, td { border: 1px solid #ddd; padding: 8px; }
+          th { background-color: #f4f4f4; }
+          tr:nth-child(even) { background-color: #f9f9f9; }
+          </style>
+          </head><body>" > sonar-report/sonar-report.html
+
+          echo "<h1>SonarCloud Analysis Report</h1>" >> sonar-report/sonar-report.html
+
+          echo "<h2>Metrics Summary</h2><ul>" >> sonar-report/sonar-report.html
+          jq -r '.component.measures[] | "<li><b>\(.metric)</b>: \(.value)</li>"' sonar-report/metrics.json >> sonar-report/sonar-report.html
+          echo "</ul>" >> sonar-report/sonar-report.html
+
+          echo "<h2>Issues</h2>" >> sonar-report/sonar-report.html
+          echo "<table><tr><th>Type</th><th>Severity</th><th>Message</th><th>File</th></tr>" >> sonar-report/sonar-report.html
+
+          jq -r '.issues[] | "<tr><td>\(.type)</td><td>\(.severity)</td><td>\(.message)</td><td>\(.component)</td></tr>"' sonar-report/issues.json >> sonar-report/sonar-report.html
+
+          echo "</table></body></html>" >> sonar-report/sonar-report.html
+
+          echo "HTML report created"
+          ls -lah sonar-report
+
+      - name: Login to ECR
+        run: |
+          ECR_URI=$(aws ecr describe-repositories --query 'repositories[0].repositoryUri' --output text)
+          aws ecr get-login-password --region $AWS_REGION \
+          | docker login --username AWS --password-stdin $(echo $ECR_URI | cut -d'/' -f1)
+
+      - name: Build Docker Image (Smart)
+        run: |
+          cd app
+          if [ -f "docker-compose.yml" ]; then
+            docker compose build
+          else
+            docker build -t devsecops-image .
+          fi
+
+      - name: Push to ECR
+        run: |
+          ECR_URI=$(aws ecr describe-repositories --query 'repositories[0].repositoryUri' --output text)
+          IMAGE=$(docker images --format "{{.Repository}}:{{.Tag}}" | head -n 1)
+          docker tag $IMAGE $ECR_URI:latest
+          docker push $ECR_URI:latest
+
+      - name: Upload Sonar Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: sonar-temp
+          path: sonar-report
+          retention-days: 1
+
+      - name: Setup SSH
+        run: |
+          echo "${{ secrets.KEY }}" > key.pem
+          chmod 400 key.pem
+
+  prepare-ec2:
+    runs-on: ubuntu-latest
+    needs: [deploy-image, terraform]
+    if: ${{ github.event.inputs.action == 'apply' }}
+
+    permissions:
+      id-token: write
+      contents: read
+
+    env:
+      AWS_REGION: ap-south-1
+      EC2_IP: ${{ needs.terraform.outputs.ec2_ip }}
+      NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
+
+    steps:
+      - name: Setup SSH
+        run: |
+          echo "${{ secrets.KEY }}" > key.pem
+          chmod 400 key.pem
+
+      - name: Cache Dependency-Check DB
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.dependency-check
+          key: dependency-check-db-${{ runner.os }}-v1
+          restore-keys: |
+            dependency-check-db-${{ runner.os }}-
+
+      - name: Install Tools on EC2
+        run: |
+          ssh -o StrictHostKeyChecking=no -i key.pem ubuntu@$EC2_IP "NVD_API_KEY='$NVD_API_KEY' bash -s" << 'EOF'
+          set +e
+          echo "========================"
+          echo "INSTALLING ALL TOOLS"
+          echo "========================"
+          sudo apt update -y
+          sudo apt install -y docker.io unzip curl wget git awscli python3-yaml
+          sudo systemctl enable docker
+          sudo systemctl start docker
+          sudo usermod -aG docker ubuntu || true
+          sudo curl -SL https://github.com/docker/compose/releases/download/v2.24.6/docker-compose-linux-x86_64 \
+            -o /usr/local/bin/docker-compose
+          sudo chmod +x /usr/local/bin/docker-compose
+          if ! command -v trivy &> /dev/null; then
+            wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
+            echo "deb https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main" | sudo tee /etc/apt/sources.list.d/trivy.list
+            sudo apt update -y
+            sudo apt install -y trivy
+          fi
+          sudo apt install -y openjdk-17-jdk
+          if [ ! -d "/opt/dependency-check" ]; then
+            cd /opt
+            sudo rm -rf dependency-check*
+            sudo wget -q https://github.com/jeremylong/DependencyCheck/releases/download/v12.1.0/dependency-check-12.1.0-release.zip
+            sudo unzip dependency-check-12.1.0-release.zip
+            if [ -d "dependency-check" ]; then
+              sudo mv dependency-check dependency-check-temp || true
+              sudo rm -rf /opt/dependency-check
+              sudo mv dependency-check-temp /opt/dependency-check
+            fi
+            sudo chmod +x /opt/dependency-check/bin/dependency-check.sh
+          fi
+          docker --version
+          trivy --version
+          aws --version
+          mkdir -p /home/ubuntu/dependency-db
+          chmod -R 777 /home/ubuntu/dependency-db
+          echo "Initializing Dependency-Check database..."
+          NVD_OPTS=""
+          if [ -n "$NVD_API_KEY" ]; then
+            echo "Using provided NVD API key for Dependency-Check updates"
+            NVD_OPTS="--nvdApiKey $NVD_API_KEY"
+          fi
+          /opt/dependency-check/bin/dependency-check.sh \
+            --updateonly \
+            --data /home/ubuntu/dependency-db \
+            $NVD_OPTS \
+            -f JSON \
+            -o /tmp/init-report || echo "⚠️ Database update failed (NVD API limit may be reached) - continuing with offline mode"
+          echo "✅ Database directory ready: /home/ubuntu/dependency-db"
+          ls -lah /home/ubuntu/dependency-db || echo "DB may need first-time setup"
+          EOF
+
+  sast-scan:
+    runs-on: ubuntu-latest
+    needs: [prepare-ec2, terraform]
+    if: ${{ github.event.inputs.action == 'apply' }}
+
+    permissions:
+      id-token: write
+      contents: read
+
+    env:
+      AWS_REGION: ap-south-1
+      EC2_IP: ${{ needs.terraform.outputs.ec2_ip }}
+      BRANCH: ${{ github.event.inputs.branch || vars.BRANCH }}
+      GBLINK: ${{ github.event.inputs.repo_url || vars.GBLINK }}
+      NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
+
+    steps:
+      - name: Setup SSH
+        run: |
+          echo "${{ secrets.KEY }}" > key.pem
+          chmod 400 key.pem
+
+      - name: SAST Scan (Trivy + OWASP Dependency Check)
+        run: |
+          ssh -o StrictHostKeyChecking=no -i key.pem ubuntu@$EC2_IP "NVD_API_KEY='$NVD_API_KEY' BRANCH='$BRANCH' GBLINK='$GBLINK' bash -s" << 'EOF'
+          set +e
+          mkdir -p /home/ubuntu/app
+          cd /home/ubuntu/app
+          rm -rf *
+          echo "========================"
+          echo "CLONING REPO"
+          echo "========================"
+          if [ -z "$BRANCH" ]; then
+            git clone "$GBLINK" .
+          else
+            git clone -b "$BRANCH" "$GBLINK" .
+          fi
+          echo "FILES AFTER CLONE:"
+          ls -lah
+          mkdir -p reports
+          echo "========================"
+          echo "LOGIN TO ECR"
+          echo "========================"
+          AWS_REGION=ap-south-1
+          ACCOUNT_ID=$(aws sts get-caller-identity \
+            --query Account \
+            --output text \
+            --region $AWS_REGION)
+          ECR_URI=$(aws ecr describe-repositories \
+            --region $AWS_REGION \
+            --query 'repositories[0].repositoryUri' \
+            --output text)
+          aws ecr get-login-password --region $AWS_REGION | \
+          docker login --username AWS --password-stdin $ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
+          echo "========================"
+          echo "PULL IMAGE FROM ECR"
+          echo "========================"
+          docker pull $ECR_URI:latest
+          echo "========================"
+          echo "TRIVY IMAGE SCAN"
+          echo "========================"
+          trivy image $ECR_URI:latest -f json -o reports/trivy-image.json
+          trivy image $ECR_URI:latest -f table -o reports/trivy-image.txt
+          echo "========================"
+          echo "TRIVY FILE SYSTEM SCAN"
+          echo "========================"
+          trivy fs . -f json -o reports/trivy-fs.json
+          trivy fs . -f table -o reports/trivy-fs.txt
+          echo "========================"
+          echo "DEPENDENCY CHECK"
+          echo "========================"
+          mkdir -p /home/ubuntu/app/reports/dependency-check
+          mkdir -p /home/ubuntu/dependency-db
+          NVD_OPTS=""
+          if [ -n "$NVD_API_KEY" ]; then
+            echo "Using provided NVD API key for Dependency-Check scan"
+            NVD_OPTS="--nvdApiKey $NVD_API_KEY"
+          fi
+          echo "Running Dependency-Check scan..."
+          if /opt/dependency-check/bin/dependency-check.sh \
+            --scan . \
+            --project "devsecops-app" \
+            --format HTML \
+            --format JSON \
+            --out /home/ubuntu/app/reports/dependency-check \
+            --data /home/ubuntu/dependency-db \
+            $NVD_OPTS \
+            --failOnCVSS 0 \
+            --enableExperimental \
+            --prettyPrint; then
+            echo "✅ Dependency Check scan completed successfully"
+          else
+            echo "⚠️ Dependency Check encountered issues (NVD API limit may be reached), attempting offline mode..."
+            /opt/dependency-check/bin/dependency-check.sh \
+              --scan . \
+              --project "devsecops-app" \
+              --format HTML \
+              --format JSON \
+              --out /home/ubuntu/app/reports/dependency-check \
+              --data /home/ubuntu/dependency-db \
+              $NVD_OPTS \
+              --failOnCVSS 0 \
+              --noupdate \
+              --enableExperimental \
+              --prettyPrint || echo "⚠️ Offline scan completed (NVD API limit reached - continuing with available data)"
+          fi
+          echo "========================"
+          echo "Dependency Check Reports:"
+          ls -lah /home/ubuntu/app/reports/dependency-check || echo "❌ No reports directory"
+          if [ -f "/home/ubuntu/app/reports/dependency-check/dependency-check-report.html" ]; then
+            echo "✅ HTML Report: $(du -sh /home/ubuntu/app/reports/dependency-check/dependency-check-report.html | cut -f1)"
+          fi
+          if [ -f "/home/ubuntu/app/reports/dependency-check/dependency-check-report.json" ]; then
+            echo "✅ JSON Report: $(du -sh /home/ubuntu/app/reports/dependency-check/dependency-check-report.json | cut -f1)"
+          fi
+          EOF
+
+  deploy-and-zap-scan:
+    runs-on: ubuntu-latest
+    needs: [sast-scan, terraform]
+    if: ${{ github.event.inputs.action == 'apply' }}
+
+    permissions:
+      id-token: write
+      contents: read
+
+    env:
+      EC2_IP: ${{ needs.terraform.outputs.ec2_ip }}
+      WEBSITE_PORT: ${{ github.event.inputs.app_port || vars.WEBSITE_PORT || '80' }}
+
+    steps:
+      - name: Setup SSH
+        run: |
+          echo "${{ secrets.KEY }}" > key.pem
+          chmod 400 key.pem
+
+      - name: Deploy + ZAP Scan
+        run: |
+          ssh -o StrictHostKeyChecking=no -i key.pem ubuntu@$EC2_IP "WEBSITE_PORT='$WEBSITE_PORT' EC2_IP='$EC2_IP' bash -s" << 'EOF'
+          set -e
+          cd /home/ubuntu/app
+
+          AWS_REGION=ap-south-1
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text --region $AWS_REGION)
+          ECR_URI=$(aws ecr describe-repositories --region $AWS_REGION --query 'repositories[0].repositoryUri' --output text)
+
+          echo "========================"
+          echo "LOGIN TO ECR"
+          echo "========================"
+          aws ecr get-login-password --region $AWS_REGION | sudo docker login --username AWS --password-stdin $ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
+
+          echo "========================"
+          echo "UPDATING DOCKER COMPOSE TO USE SECURE ECR IMAGE"
+          echo "========================"
+          if [ -f "docker-compose.yml" ]; then
+            python3 -c "
+          import yaml
+          try:
+              with open('docker-compose.yml', 'r') as f:
+                  data = yaml.safe_load(f)
+              updated = False
+              for name, svc in data.get('services', {}).items():
+                  if 'build' in svc:
+                      del svc['build']
+                      svc['image'] = '$ECR_URI:latest'
+                      updated = True
+              if updated:
+                  with open('docker-compose.yml', 'w') as f:
+                      yaml.dump(data, f)
+                  print('✅ Updated docker-compose.yml to use ECR image')
+              else:
+                  print('ℹ️ No build service found, using default compose config')
+          except Exception as e:
+              print('⚠️ Error processing docker-compose.yml:', e)
+          "
+          else
+            echo "docker-compose.yml NOT FOUND ❌"
+            exit 1
+          fi
+
+          echo "========================"
+          echo "STARTING APP"
+          echo "========================"
+          sudo docker-compose down || true
+          sudo docker-compose up -d
+
+          echo "========================"
+          echo "VERIFY CONTAINERS"
+          echo "========================"
+          docker ps -a
+          echo "Waiting for app to start..."
+          sleep 20
+          
+          echo "========================"
+          echo "TEST APP LOCAL REACHABILITY"
+          echo "========================"
+          if [ -z "$WEBSITE_PORT" ]; then
+            echo "ERROR: WEBSITE_PORT is not set."
+            exit 1
+          fi
+          curl -I http://localhost:$WEBSITE_PORT || echo "App still not reachable"
+          
+          mkdir -p reports/zap
+          echo "========================"
+          echo "ZAP DAST SCAN"
+          echo "========================"
+          sudo docker run --rm \
+            -w /zap/wrk \
+            -v /home/ubuntu/app/reports:/zap/wrk \
+            ghcr.io/zaproxy/zaproxy:stable \
+            zap-baseline.py \
+            -t http://$EC2_IP:$WEBSITE_PORT \
+            -r zap/zap-report.html \
+            -x zap/zap-report.xml \
+            -J zap/zap-report.json \
+            --auto || true
+
+          echo "ZAP Reports:"
+          ls -lah /home/ubuntu/app/reports/zap
+          EOF
+
+  fetch-reports:
+    runs-on: ubuntu-latest
+    needs: [deploy-and-zap-scan, terraform]
+    if: ${{ github.event.inputs.action == 'apply' }}
+
+    permissions:
+      id-token: write
+      contents: read
+
+    env:
+      EC2_IP: ${{ needs.terraform.outputs.ec2_ip }}
+
+    steps:
+      - name: Setup SSH
+        run: |
+          echo "${{ secrets.KEY }}" > key.pem
+          chmod 400 key.pem
+
+      - name: Fetch Reports
+        run: |
+          mkdir -p reports
+          scp -r -o StrictHostKeyChecking=no -i key.pem ubuntu@$EC2_IP:/home/ubuntu/app/reports/* reports/
+
+      - name: Download Sonar Report
+        uses: actions/download-artifact@v4
+        with:
+          name: sonar-temp
+          path: reports/sonar
+      
+      - name: Upload Reports to GitHub Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-reports
+          path: reports
