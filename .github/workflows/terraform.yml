@@ -567,26 +567,25 @@ jobs:
           echo "UPDATING DOCKER COMPOSE TO USE SECURE ECR IMAGE"
           echo "========================"
           if [ -f "docker-compose.yml" ]; then
-            python3 -c "
+            DEPLOY_MODE=$(python3 -c "
           import yaml
           try:
               with open('docker-compose.yml', 'r') as f:
                   data = yaml.safe_load(f)
-              updated = False
-              for name, svc in data.get('services', {}).items():
-                  if 'build' in svc:
-                      del svc['build']
-                      svc['image'] = '$ECR_URI:latest'
-                      updated = True
-              if updated:
+              services_with_build = [name for name, svc in data.get('services', {}).items() if 'build' in svc]
+              if len(services_with_build) == 1:
+                  svc_name = services_with_build[0]
+                  del data['services'][svc_name]['build']
+                  data['services'][svc_name]['image'] = '$ECR_URI:latest'
                   with open('docker-compose.yml', 'w') as f:
                       yaml.dump(data, f)
-                  print('✅ Updated docker-compose.yml to use ECR image')
+                  print('ecr')
               else:
-                  print('ℹ️ No build service found, using default compose config')
+                  print('local')
           except Exception as e:
-              print('⚠️ Error processing docker-compose.yml:', e)
-          "
+              print('local')
+          ")
+            echo "Deployment Mode: $DEPLOY_MODE"
           else
             echo "docker-compose.yml NOT FOUND ❌"
             exit 1
@@ -596,7 +595,14 @@ jobs:
           echo "STARTING APP"
           echo "========================"
           sudo docker-compose down || true
-          sudo docker-compose up -d
+          if [ "$DEPLOY_MODE" = "ecr" ]; then
+            echo "Deploying via pulled ECR image..."
+            sudo docker-compose up -d
+          else
+            echo "Deploying via local build on EC2 (multi-service detected)..."
+            sudo docker-compose up -d --build
+          fi
+
 
           echo "========================"
           echo "VERIFY CONTAINERS"
