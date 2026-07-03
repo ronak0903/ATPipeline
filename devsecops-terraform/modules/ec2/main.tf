@@ -1,9 +1,3 @@
-data "aws_security_group" "default" {
-  count  = var.create_sg ? 0 : 1
-  vpc_id = var.vpc_id
-  name   = "default"
-}
-
 resource "aws_security_group" "sg" {
   count  = var.create_sg ? 1 : 0
   vpc_id = var.vpc_id
@@ -73,7 +67,9 @@ resource "aws_instance" "devsecops" {
   subnet_id     = var.subnet_id
   key_name      = var.key_name
 
-  vpc_security_group_ids = [var.create_sg ? aws_security_group.sg[0].id : data.aws_security_group.default[0].id]
+  # If create_sg is false, pass null to let AWS automatically attach the Default Security Group.
+  # This avoids calling DescribeSecurityGroups, which is blocked by SCP in restricted accounts.
+  vpc_security_group_ids = var.create_sg ? [aws_security_group.sg[0].id] : null
 
   iam_instance_profile = var.create_iam_profile ? aws_iam_instance_profile.ec2_profile[0].name : (var.existing_iam_profile != "" ? var.existing_iam_profile : null)
 
