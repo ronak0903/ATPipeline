@@ -296,9 +296,14 @@ jobs:
 
       - name: Login to ECR
         run: |
-          ECR_URI=$(aws ecr describe-repositories --query 'repositories[0].repositoryUri' --output text)
-          aws ecr get-login-password --region $AWS_REGION \
-          | docker login --username AWS --password-stdin $(echo $ECR_URI | cut -d'/' -f1)
+          ECR_URI=$(aws ecr describe-repositories --query 'repositories[0].repositoryUri' --output text 2>/dev/null || echo "")
+          if [ -n "$ECR_URI" ]; then
+            echo "ECR_URI=$ECR_URI" >> $GITHUB_ENV
+            aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $(echo $ECR_URI | cut -d'/' -f1)
+          else
+            echo "⚠️ No ECR repositories found or ECR access denied. ECR login/push will be skipped."
+            echo "ECR_URI=" >> $GITHUB_ENV
+          fi
 
       - name: Build Docker Image (Smart)
         run: |
@@ -311,10 +316,13 @@ jobs:
 
       - name: Push to ECR
         run: |
-          ECR_URI=$(aws ecr describe-repositories --query 'repositories[0].repositoryUri' --output text)
-          IMAGE=$(docker images --format "{{.Repository}}:{{.Tag}}" | head -n 1)
-          docker tag $IMAGE $ECR_URI:latest
-          docker push $ECR_URI:latest
+          if [ -n "$ECR_URI" ]; then
+            IMAGE=$(docker images --format "{{.Repository}}:{{.Tag}}" | head -n 1)
+            docker tag $IMAGE $ECR_URI:latest
+            docker push $ECR_URI:latest
+          else
+            echo "⚠️ Skipping ECR push (no ECR repository available)."
+          fi
 
       - name: Upload Sonar Report
         uses: actions/upload-artifact@v4
@@ -453,7 +461,7 @@ jobs:
           ls -lah
           mkdir -p reports
           echo "========================"
-          echo "LOGIN TO ECR"
+          echo "CHECKING FOR ECR REPOSITORY"
           echo "========================"
           AWS_REGION=ap-south-1
           ACCOUNT_ID=$(aws sts get-caller-identity \
@@ -463,18 +471,39 @@ jobs:
           ECR_URI=$(aws ecr describe-repositories \
             --region $AWS_REGION \
             --query 'repositories[0].repositoryUri' \
-            --output text)
-          aws ecr get-login-password --region $AWS_REGION | \
-          docker login --username AWS --password-stdin $ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
-          echo "========================"
-          echo "PULL IMAGE FROM ECR"
-          echo "========================"
-          docker pull $ECR_URI:latest
-          echo "========================"
-          echo "TRIVY IMAGE SCAN"
-          echo "========================"
-          trivy image $ECR_URI:latest -f json -o reports/trivy-image.json
-          trivy image $ECR_URI:latest -f table -o reports/trivy-image.txt
+            --output text 2>/dev/null || echo "")
+          
+          if [ -n "$ECR_URI" ]; then
+            echo "ECR Repository detected: $ECR_URI"
+            aws ecr get-login-password --region $AWS_REGION | \
+            docker login --username AWS --password-stdin $ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
+            echo "========================"
+            echo "PULL IMAGE FROM ECR"
+            echo "========================"
+            docker pull $ECR_URI:latest
+            echo "========================"
+            echo "TRIVY IMAGE SCAN (ECR)"
+            echo "========================"
+            trivy image $ECR_URI:latest -f json -o reports/trivy-image.json
+            trivy image $ECR_URI:latest -f table -o reports/trivy-image.txt
+          else
+            echo "⚠️ ECR is not available. Building image locally on EC2 to scan..."
+            echo "========================"
+            echo "BUILDING IMAGE LOCALLY"
+            echo "========================"
+            if [ -f "docker-compose.yml" ]; then
+              sudo docker-compose build
+              LOCAL_IMAGE=$(sudo docker images --format "{{.Repository}}:{{.Tag}}" | head -n 1)
+            else
+              sudo docker build -t devsecops-image:latest .
+              LOCAL_IMAGE="devsecops-image:latest"
+            fi
+            echo "========================"
+            echo "TRIVY IMAGE SCAN (LOCAL)"
+            echo "========================"
+            sudo trivy image $LOCAL_IMAGE -f json -o reports/trivy-image.json
+            sudo trivy image $LOCAL_IMAGE -f table -o reports/trivy-image.txt
+          fi
           echo "========================"
           echo "TRIVY FILE SYSTEM SCAN"
           echo "========================"
@@ -556,47 +585,56 @@ jobs:
 
           AWS_REGION=ap-south-1
           ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text --region $AWS_REGION)
-          ECR_URI=$(aws ecr describe-repositories --region $AWS_REGION --query 'repositories[0].repositoryUri' --output text)
+          ECR_URI=$(aws ecr describe-repositories --region $AWS_REGION --query 'repositories[0].repositoryUri' --output text 2>/dev/null || echo "")
 
-          echo "========================"
-          echo "LOGIN TO ECR"
-          echo "========================"
-          aws ecr get-login-password --region $AWS_REGION | sudo docker login --username AWS --password-stdin $ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
+          if [ -n "$ECR_URI" ]; then
+            echo "========================"
+            echo "LOGIN TO ECR"
+            echo "========================"
+            aws ecr get-login-password --region $AWS_REGION | sudo docker login --username AWS --password-stdin $ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
 
-          echo "========================"
-          echo "UPDATING DOCKER COMPOSE TO USE SECURE ECR IMAGE"
-          echo "========================"
-          if [ -f "docker-compose.yml" ]; then
-            python3 -c "
-          import yaml
-          try:
-              with open('docker-compose.yml', 'r') as f:
-                  data = yaml.safe_load(f)
-              updated = False
-              for name, svc in data.get('services', {}).items():
-                  if 'build' in svc:
-                      del svc['build']
-                      svc['image'] = '$ECR_URI:latest'
-                      updated = True
-              if updated:
-                  with open('docker-compose.yml', 'w') as f:
-                      yaml.dump(data, f)
-                  print('✅ Updated docker-compose.yml to use ECR image')
-              else:
-                  print('ℹ️ No build service found, using default compose config')
-          except Exception as e:
-              print('⚠️ Error processing docker-compose.yml:', e)
-          "
+            echo "========================"
+            echo "UPDATING DOCKER COMPOSE TO USE SECURE ECR IMAGE"
+            echo "========================"
+            if [ -f "docker-compose.yml" ]; then
+              python3 -c "
+            import yaml
+            try:
+                with open('docker-compose.yml', 'r') as f:
+                    data = yaml.safe_load(f)
+                updated = False
+                for name, svc in data.get('services', {}).items():
+                    if 'build' in svc:
+                        del svc['build']
+                        svc['image'] = '$ECR_URI:latest'
+                        updated = True
+                if updated:
+                    with open('docker-compose.yml', 'w') as f:
+                        yaml.dump(data, f)
+                    print('✅ Updated docker-compose.yml to use ECR image')
+                else:
+                    print('ℹ️ No build service found, using default compose config')
+            except Exception as e:
+                print('⚠️ Error processing docker-compose.yml:', e)
+            "
+            else
+              echo "docker-compose.yml NOT FOUND ❌"
+              exit 1
+            fi
+
+            echo "========================"
+            echo "STARTING APP FROM ECR"
+            echo "========================"
+            sudo docker-compose down || true
+            sudo docker-compose up -d
           else
-            echo "docker-compose.yml NOT FOUND ❌"
-            exit 1
+            echo "⚠️ ECR is not available. Deploying via local build on EC2..."
+            echo "========================"
+            echo "STARTING APP FROM LOCAL BUILD"
+            echo "========================"
+            sudo docker-compose down || true
+            sudo docker-compose up -d --build
           fi
-
-          echo "========================"
-          echo "STARTING APP"
-          echo "========================"
-          sudo docker-compose down || true
-          sudo docker-compose up -d
 
           echo "========================"
           echo "VERIFY CONTAINERS"
