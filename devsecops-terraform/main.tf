@@ -23,6 +23,7 @@ module "ec2" {
   instance_type = var.instance_type
   key_name      = var.key_name
   ami_id        = var.ami_id
+  region        = var.region
 
   # If create_vpc is false, pass null to let AWS automatically select the default subnet.
   # This avoids calling DescribeSubnets, which is blocked by SCP in restricted accounts.

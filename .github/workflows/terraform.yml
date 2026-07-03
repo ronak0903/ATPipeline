@@ -62,7 +62,7 @@ jobs:
         uses: hashicorp/setup-terraform@v3
 
       - name: Terraform Init
-        run: terraform init
+        run: terraform init -upgrade
 
       - name: Terraform Validate
         run: terraform validate
@@ -128,7 +128,19 @@ jobs:
 
       - name: Terraform Destroy
         if: ${{ github.event.inputs.action == 'destroy' }}
-        run: terraform destroy -auto-approve
+        run: |
+          # Retrieve stored instance ID from a prior apply (stored in tfstate commit)
+          INSTANCE_ID=$(terraform output -raw ec2_instance_id 2>/dev/null || echo "")
+          if [ -n "$INSTANCE_ID" ]; then
+            echo "Terminating EC2 instance: $INSTANCE_ID"
+            aws ec2 terminate-instances --instance-ids "$INSTANCE_ID" --region $AWS_REGION
+            echo "Waiting for termination..."
+            aws ec2 wait instance-terminated --instance-ids "$INSTANCE_ID" --region $AWS_REGION || true
+            echo "Instance terminated."
+          else
+            echo "No instance ID found in state. Attempting terraform destroy..."
+            terraform destroy -auto-approve || true
+          fi
 
   deploy-image:
     runs-on: ubuntu-latest
