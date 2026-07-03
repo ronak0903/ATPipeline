@@ -73,21 +73,14 @@ resource "aws_iam_instance_profile" "ec2_profile" {
 }
 
 resource "aws_instance" "devsecops" {
-  ami           = data.aws_ami.ubuntu.id
+  ami           = var.ami_id
   instance_type = var.instance_type
-  subnet_id     = var.subnet_id
-  key_name      = var.key_name
-
-  vpc_security_group_ids = [aws_security_group.sg.id]
-
-  iam_instance_profile = aws_iam_instance_profile.ec2_profile.name
-
-  root_block_device {
-    volume_size = 30
-    volume_type = "gp3"
-  }
 
   tags = {
-    Name = "DevSecOps-Instance"
+    Environment = "Dev"
+  }
+
+  volume_tags = {
+    Environment = "Dev"
   }
 }
