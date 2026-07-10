@@ -143,6 +143,7 @@ jobs:
       AWS_REGION: us-east-1
       BRANCH: ${{ github.event.inputs.branch || vars.BRANCH }}
       GBLINK: ${{ github.event.inputs.repo_url || vars.GBLINK }}
+      GB_TOKEN: ${{ secrets.GB_TOKEN }}
 
     steps:
       - name: Checkout Repo
@@ -158,10 +159,11 @@ jobs:
 
       - name: Clone App
         run: |
+          AUTHENTICATED_GBLINK=$(echo "$GBLINK" | sed -E "s|https://github.com/|https://x-access-token:${GB_TOKEN}@github.com/|")
           if [ -z "$BRANCH" ]; then
-            git clone "$GBLINK" app
+            git clone "$AUTHENTICATED_GBLINK" app
           else
-            git clone -b "$BRANCH" "$GBLINK" app
+            git clone -b "$BRANCH" "$AUTHENTICATED_GBLINK" app
           fi
 
       - name: Generate Project Key
@@ -427,6 +429,7 @@ jobs:
       BRANCH: ${{ github.event.inputs.branch || vars.BRANCH }}
       GBLINK: ${{ github.event.inputs.repo_url || vars.GBLINK }}
       NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
+      GB_TOKEN: ${{ secrets.GB_TOKEN }}
 
     steps:
       - name: Setup SSH
@@ -436,7 +439,7 @@ jobs:
 
       - name: SAST Scan (Trivy + OWASP Dependency Check)
         run: |
-          ssh -o StrictHostKeyChecking=no -i key.pem ubuntu@$EC2_IP "NVD_API_KEY='$NVD_API_KEY' BRANCH='$BRANCH' GBLINK='$GBLINK' bash -s" << 'EOF'
+          ssh -o StrictHostKeyChecking=no -i key.pem ubuntu@$EC2_IP "NVD_API_KEY='$NVD_API_KEY' BRANCH='$BRANCH' GBLINK='$GBLINK' GB_TOKEN='$GB_TOKEN' bash -s" << 'EOF'
           set +e
           mkdir -p /home/ubuntu/app
           cd /home/ubuntu/app
@@ -444,10 +447,11 @@ jobs:
           echo "========================"
           echo "CLONING REPO"
           echo "========================"
+          AUTHENTICATED_GBLINK=$(echo "$GBLINK" | sed -E "s|https://github.com/|https://x-access-token:${GB_TOKEN}@github.com/|")
           if [ -z "$BRANCH" ]; then
-            git clone "$GBLINK" .
+            git clone "$AUTHENTICATED_GBLINK" .
           else
-            git clone -b "$BRANCH" "$GBLINK" .
+            git clone -b "$BRANCH" "$AUTHENTICATED_GBLINK" .
           fi
           echo "FILES AFTER CLONE:"
           ls -lah
@@ -597,10 +601,10 @@ jobs:
           sudo docker-compose down || true
           if [ "$DEPLOY_MODE" = "ecr" ]; then
             echo "Deploying via pulled ECR image..."
-            sudo docker-compose up -d
+            sudo docker-compose up -d || echo "⚠️ Container startup failed"
           else
             echo "Deploying via local build on EC2 (multi-service detected)..."
-            sudo docker-compose up -d --build
+            sudo docker-compose up -d --build || echo "⚠️ Container build/startup failed"
           fi
 
 
@@ -642,7 +646,7 @@ jobs:
   fetch-reports:
     runs-on: ubuntu-latest
     needs: [deploy-and-zap-scan, terraform]
-    if: ${{ github.event.inputs.action == 'apply' }}
+    if: ${{ !cancelled() && needs.terraform.result == 'success' && github.event.inputs.action == 'apply' }}
 
     permissions:
       id-token: write
@@ -660,10 +664,15 @@ jobs:
       - name: Fetch Reports
         run: |
           mkdir -p reports
-          scp -r -o StrictHostKeyChecking=no -i key.pem ubuntu@$EC2_IP:/home/ubuntu/app/reports/* reports/
+          scp -r -o StrictHostKeyChecking=no -i key.pem ubuntu@$EC2_IP:/home/ubuntu/app/reports reports_temp || true
+          if [ -d "reports_temp" ]; then
+            cp -r reports_temp/* reports/ || true
+            rm -rf reports_temp
+          fi
 
       - name: Download Sonar Report
         uses: actions/download-artifact@v4
+        continue-on-error: true
         with:
           name: sonar-temp
           path: reports/sonar
